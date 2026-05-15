@@ -1,0 +1,7 @@
+.env
+chat_memory.db
+chroma_db/
+uploaded_pdfs/
+venv/
+__pycache__/
+*.pyc
