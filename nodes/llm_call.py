@@ -1,55 +1,83 @@
-from state import AgentState
-from openai import OpenAI
-from dotenv import load_dotenv
 import os
-import json
-from nodes.tools.rag import query_rag
-from nodes.tools.search import search
+import re
+from openai import OpenAI, BadRequestError
+from dotenv import load_dotenv
+
+from state import AgentState
+from nodes.tools.registry import TOOL_SCHEMAS
+
 load_dotenv()
 
-API_KEY=os.environ.get('GROQ_API_KEY')
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.environ.get('GROQ_API_KEY'),
+)
+MODEL = os.environ.get('GROQ_MODEL', 'openai/gpt-oss-120b')
 
-def clean_query(user_input: str) -> str:
-    client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=API_KEY
-        )
-    response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-            {"role": "system", "content": f'''Extract a clean, concise search query from the user message. Return only the query, nothing else.'''},{"role": "user", "content": user_input}]
-        )
-    return response.choices[0].message.content
+CITATION_RE = re.compile(r'【[^】]*】')
+
+NUDGE = {
+    "role": "user",
+    "content": (
+        "That tool does not exist. Use only the tools provided in this request, "
+        "or answer directly from the results you already have."
+    ),
+}
 
 
-def llm_call(state:AgentState)->dict:
-        
-    if state['query_type'] == 'search':
-        state['tool_result'] = search(clean_query(state['user_input']))
-    elif state['query_type'] == 'rag':
-        state['tool_result'] = query_rag(state['user_input'])
+def _content(response) -> str:
+    """Model text with gpt-oss citation markers stripped."""
+    return CITATION_RE.sub('', response.choices[0].message.content or '').strip()
 
-    tool_context = f"Tool Results: {state['tool_result']}" if state['query_type'] in ['search', 'rag'] else ""
 
-    client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=API_KEY
-        )
-    if state['query_type']=='structured':
-        response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-            {"role": "system", "content": f'''You are a helpful assistant. Here is what you know about the user: {state['long_term_memory']} {tool_context}. Return your response as a valid JSON array only. No explanation, no markdown, just raw JSON.'''},
-            *state['messages'],{"role": "user", "content": state['user_input']}]
-        )
-        return {
-            'structured_output': json.loads(response.choices[0].message.content),'response': response.choices[0].message.content,'tool_result': state['tool_result']
+def _to_assistant(response) -> dict:
+    """Convert an SDK message into a plain, JSON-serialisable dict."""
+    msg = response.choices[0].message
+    assistant_msg = {"role": "assistant", "content": _content(response)}
+    if msg.tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
             }
-    else:
-        response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                {"role": "system", "content": f'''You are a helpful assistant. Here is what you know about the user: {state['long_term_memory']} {tool_context}'''},
-                *state['messages'],{"role": "user", "content": state['user_input']}]
-            )
-    return {'response':response.choices[0].message.content,'tool_result': state['tool_result']}
+            for tc in msg.tool_calls
+        ]
+    return assistant_msg
+
+
+def _complete(messages):
+    return client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=TOOL_SCHEMAS,
+        tool_choice="auto",
+    )
+
+
+def llm_call(state: AgentState) -> dict:
+    """Ask the model what to do next.
+
+    It either answers (content, no tool_calls) or requests one or more tools.
+    We do not decide for it -- that is the entire point of the loop.
+    """
+    try:
+        response = _complete(state['messages'])
+    except BadRequestError as e:
+        if 'tool_use_failed' not in str(e):
+            raise
+        # Model hallucinated a tool (gpt-oss reaching for its built-in
+        # browser). Tell it so and give it one more attempt.
+        response = _complete(state['messages'] + [NUDGE])
+        return {
+            "messages": [NUDGE, _to_assistant(response)],
+            "response": _content(response),
+        }
+
+    return {
+        "messages": [_to_assistant(response)],
+        "response": _content(response),
+    }
