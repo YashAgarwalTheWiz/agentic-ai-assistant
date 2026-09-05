@@ -1,6 +1,6 @@
 # 🤖 Agentic AI Assistant
 
-A tool-calling AI agent with short-term memory, long-term memory, RAG over uploaded PDFs, web search, MCP-sourced tools, and email sending — all gated behind a **human approval gate** for any action that changes the outside world — built with LangGraph, FastAPI, ChromaDB, SQLite, and Streamlit. Includes a growing evaluation suite covering tool-selection accuracy and output quality.
+A tool-calling AI agent with short-term memory, long-term memory, RAG over uploaded PDFs, web search, MCP-sourced tools, and email sending — all gated behind a **human approval gate** for any action that changes the outside world — built with LangGraph, FastAPI, ChromaDB, SQLite, and Streamlit. Includes a growing evaluation suite covering deterministic safety guarantees, tool-selection accuracy, and output quality.
 
 ---
 
@@ -15,32 +15,30 @@ A tool-calling AI agent with short-term memory, long-term memory, RAG over uploa
 - **Send email** — sends a real email via Gmail SMTP; gated like every other write tool
 - **Human approval gate** — write tools cannot execute until a human approves. The graph suspends mid-run and resumes on decision. Arguments are editable before approval.
 - **Audit trail** — every approval and cancellation recorded to SQLite _before_ the tool runs
-- **Deterministic safety tests** — gate fail-closed behaviour, tool-error handling, and PDF-upload error handling, all in `tests/`
-- **Model-driven evaluation** — tool-selection accuracy and output-quality checks (faithfulness, relevancy) against seed cases, in `eval/`
+- **Deterministic safety tests** — 17 tests covering gate fail-closed behaviour, tool-error handling, and PDF-upload error handling
+- **Model-driven evaluation** — tool-selection accuracy and output-quality checks (faithfulness, relevancy) against seed cases
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-
 Streamlit (UI)
-↓ HTTP
+     ↓ HTTP
 FastAPI (Backend)
-↓
-LangGraph Agent (SqliteSaver checkpointer)
+     ↓
+LangGraph Agent   (SqliteSaver checkpointer)
 
-START
-↓
-memory_retrieval SQLite history + ChromaDB facts + system prompt
-↓
-llm_call ←────────┐ model answers, or requests tools
-↓ │
-[tool_calls?] │
-├── yes ──→ tool_node ──┘ read tools run immediately
-│ write tools → interrupt() → wait for human
-└── no ──→ memory_writer → END
-
+   START
+     ↓
+  memory_retrieval      SQLite history + ChromaDB facts + system prompt
+     ↓
+  llm_call  ←────────┐  model answers, or requests tools
+     ↓               │
+  [tool_calls?]      │
+     ├── yes ──→ tool_node ──┘   read tools run immediately
+     │                            write tools → interrupt() → wait for human
+     └── no  ──→ memory_writer → END
 ```
 
 ---
@@ -73,9 +71,17 @@ def save_note(title: str, body: str) -> str:
 
 Split into two kinds, deliberately kept separate:
 
-**`tests/`** — deterministic. Same input, same result, every time. Covers the approval gate's fail-closed behaviour, a tool that throws or is called with wrong arguments, and a scanned PDF with no extractable text returning a clean 400 instead of a 500.
+**`tests/`** — deterministic. Same input, same result, every time.
 
-**`eval/`** — calls the real model (and real external services), so a single run isn't a reliable measurement. Each case runs several trials and reports a pass _rate_, not a verdict — a single miss can mean the model's ordinary variance, or a tool description that needs sharper wording, not a bug.
+**`eval/`** — calls the real model (and real external services), so a single run isn't a reliable measurement. Each case runs several trials and reports a pass _rate_, not a verdict.
+
+### Deterministic tests
+
+`tests/` — 17 tests total, all passing (`pytest tests/ -v` for the current count as this grows):
+
+- `test_gate.py` and `test_safety.py` — the approval gate's fail-closed behaviour and audit-log consistency (built during Phase 3)
+- `test_tool_error_handling.py` — a tool that raises, and a tool called with the wrong arguments, both degrade to a clean error string handed back to the model, never a crash
+- `test_pdf_upload_errors.py` — uploading a PDF with no extractable text (a scan with no OCR layer) returns a clean `400`, not an unhandled `500`, using FastAPI's `TestClient` rather than a real scanned file
 
 ### Tool-selection eval
 
@@ -85,7 +91,7 @@ Split into two kinds, deliberately kept separate:
 
 `eval/groq_judge.py` wraps the project's existing Groq client as a DeepEval-compatible judge model, so evaluation runs on the same free-tier setup as the rest of the app rather than requiring a separate OpenAI key.
 
-DeepEval's metrics need the judge to return valid JSON matching a schema — a real risk with a smaller model, since DeepEval's own docs note this can fail evaluation outright. The wrapper handles it defensively: strips markdown code fences the model may add despite instructions not to (same category of cleanup as the citation-marker regex in `llm_call.py`), and on a failed parse, retries once with a corrective nudge before raising a clear `JudgeOutputError` — rather than a buried DeepEval-internal traceback.
+DeepEval's metrics need the judge to return valid JSON matching a schema — a real risk with a smaller model, since DeepEval's own docs note this can fail evaluation outright. The wrapper handles it defensively: strips markdown code fences the model may add despite instructions not to, and on a failed parse, retries once with a corrective nudge before raising a clear `JudgeOutputError` — rather than a buried DeepEval-internal traceback.
 
 Validated with `eval/judge_stress_test.py` against a nested list-of-objects schema (structurally closer to what real metrics use internally than a flat object) and `FaithfulnessMetric` runs against both a supported and a genuinely contradicted claim — confirming the judge correctly distinguishes "consistent with the given sources" from "contradicts them," not just producing a plausible-sounding number regardless of content.
 
@@ -178,7 +184,7 @@ streamlit run streamlit_app.py
 ## 🧪 Testing
 
 ```bash
-pytest tests/ -v                     # deterministic
+pytest tests/ -v                     # deterministic (17 tests)
 python eval/tool_selection.py        # tool-selection accuracy
 python eval/judge_stress_test.py     # output-quality judge validation
 python show_log.py                   # audit trail
@@ -209,6 +215,8 @@ python show_ltm.py                   # current long-term memory
 
 **DeepEval's default judge is OpenAI, and defaults to expecting strong instruction-following for JSON output.** Using the app's own Groq-hosted model as the judge instead avoids a second provider dependency, but needs defensive handling (code-fence stripping, one corrective retry) to stay reliable — validated separately in `judge_stress_test.py` before relying on it for anything real.
 
+**A metric measuring "faithfulness to sources" is not the same as measuring "sources are trustworthy."** An early test assumed a weak, informal source (a social-media caption) would be treated skeptically — but `FaithfulnessMetric` only checks for contradiction with the given context, not source quality. It correctly scored 1.0 because nothing in the context actually disagreed with the claim. The real test needed two sources that genuinely conflict, which produced the expected low score with reasoning that named the actual contradiction.
+
 **Eval and tests are deliberately separate folders**, not different naming within one. A test calling the real model isn't testing code — it's measuring behaviour that can legitimately vary run to run, and conflating the two makes a flaky eval look like a broken test.
 
 ### Known limitations
@@ -218,6 +226,7 @@ python show_ltm.py                   # current long-term memory
 - One MCP server connected (DeepWiki); no allowlist yet, so even its harmless tools are gated by default.
 - `send_email` has no delivery confirmation beyond SMTP acceptance.
 - Output-quality eval has been validated against reconstructed and stress-test data, not yet against a real captured agent response end-to-end.
+- Deterministic test count (17) will change as `tests/` grows — check `pytest tests/ -v` for the current total rather than trusting this number to stay accurate.
 - Single hardcoded `default_user`; one Chroma collection shared across all chats.
 
 ### Next
