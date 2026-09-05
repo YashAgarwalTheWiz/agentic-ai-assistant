@@ -38,11 +38,18 @@ def ingest_pdf(file_path: str) -> int:
 @tool(
     name="search_documents",
     description=(
-        "Search the PDFs the user has uploaded. Use this whenever a listed "
-        "uploaded document could plausibly contain the answer, including for "
-        "technical or academic questions phrased generally. Prefer this over "
-        "answering from your own knowledge when a relevant document exists -- "
-        "the user's document is more authoritative than your memory."
+        "Search the user's own uploaded PDF document(s) for a specific answer "
+        "contained within them. Use this ONLY when the user is asking about "
+        "their own uploaded material specifically -- for example, they say "
+        "'my document', 'the paper I uploaded', 'according to the PDF', or ask "
+        "a direct follow-up about something already discussed from an uploaded "
+        "file. Do NOT use this for a general technical, scientific, or academic "
+        "question just because it sounds like something a paper might cover -- "
+        "questions like 'explain how photosynthesis works' or 'what is gradient "
+        "descent' are general knowledge and should be answered directly, even "
+        "if an uploaded document happens to use similar vocabulary or is on a "
+        "related topic. If unsure whether the question is about the user's "
+        "specific document versus general knowledge, prefer answering directly."
     ),
     parameters={
         "type": "object",
@@ -61,7 +68,6 @@ def ingest_pdf(file_path: str) -> int:
         "required": ["query"],
     },
 )
-
 def search_documents(query: str) -> str:
     results = rag_collection.query(query_texts=[query], n_results=5)
     docs = results['documents'][0] if results['documents'] else []
