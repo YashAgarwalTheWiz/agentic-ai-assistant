@@ -1,11 +1,12 @@
-from typing import TypedDict,Literal,List,Dict,Optional
+from typing import TypedDict,Literal,List,Dict,Optional,Any,Annotated
+import operator
 
 class AgentState(TypedDict):
-    messages:List[Dict[str,str]]
+    messages:Annotated[List[Dict[str,Any]],operator.add]
     chat_id:str
     long_term_memory:str
-    query_type:Literal['chat','search','rag','structured']
+    thread_id: str
     user_input:str
     response:str
-    tool_result:Optional[str]
-    structured_output: Optional[list]
+    steps:int
+    executed_tools: Annotated[List[str], operator.add]
