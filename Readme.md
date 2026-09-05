@@ -1,6 +1,6 @@
 # 🤖 Agentic AI Assistant
 
-A tool-calling AI agent with short-term memory, long-term memory, RAG over uploaded PDFs, web search, MCP-sourced tools, and a **human approval gate** on any action that changes the outside world — built with LangGraph, FastAPI, ChromaDB, SQLite, and Streamlit.
+A tool-calling AI agent with short-term memory, long-term memory, RAG over uploaded PDFs, web search, MCP-sourced tools, and email sending — all gated behind a **human approval gate** for any action that changes the outside world — built with LangGraph, FastAPI, ChromaDB, SQLite, and Streamlit.
 
 ---
 
@@ -12,6 +12,7 @@ A tool-calling AI agent with short-term memory, long-term memory, RAG over uploa
 - **Web search** — DuckDuckGo, called when the model decides it needs current information
 - **RAG** — upload a PDF, chunked into ChromaDB; filenames are injected into the system prompt
 - **MCP tool sourcing** — connects to remote MCP servers and registers their tools automatically, alongside hand-written ones
+- **Send email** — sends a real email via Gmail SMTP; gated like every other write tool
 - **Human approval gate** — write tools cannot execute until a human approves. The graph suspends mid-run and resumes on decision. Arguments are editable before approval.
 - **Audit trail** — every approval and cancellation recorded to SQLite *before* the tool runs
 - **Safety test suite** — asserts no malformed or mismatched approval can trigger a write
@@ -59,9 +60,20 @@ def save_note(title: str, body: str) -> str:
 
 ### MCP-sourced tools
 
-`nodes/tools/mcp_bridge.py` connects to a remote MCP server at import time, asks it for its tools, and registers each one through the same `@tool` decorator as a hand-written tool. From `tool_node`'s side, an MCP tool is indistinguishable from `save_note`.
+`nodes/tools/mcp_bridge.py` connects to a remote MCP server at import time, asks it for its tools, and registers each one through the same `@tool` decorator as a hand-written tool. Classification does **not** trust the server: a tool is only read-only if its `annotations.readOnlyHint` is exactly `True`. Missing annotations default to gated — confirmed necessary, since DeepWiki (the connected server, genuinely read-only) sends no annotations at all.
 
-Classification does **not** trust the server: a tool is only read-only if its `annotations.readOnlyHint` is exactly `True`. Missing or absent annotations default to gated. This isn't theoretical — DeepWiki (the connected server, genuinely read-only) sends no annotations at all, so its tools are currently gated purely as a safe default, not because they're actually risky. No allowlist yet to relax that.
+### Sending email
+
+`nodes/tools/mailer.py` — `send_email` sends a real message via Gmail SMTP, authenticated with an app password (not the account's real password). It's a write tool like any other, so every send is gated and shows up in the audit log — which matters more here than for `save_note`, since a sent email can't be undone or checked afterward the way a local file can.
+
+**Setup:** enable 2-Step Verification on the sending Gmail account, generate an app password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords), and add to `.env`:
+
+```
+GMAIL_ADDRESS=your_address@gmail.com
+GMAIL_APP_PASSWORD=the16characterpassword
+```
+
+**Known deliverability caveat:** `smtplib` completing without error only means Gmail *accepted* the message — not that it reached the inbox. A message to a brand-new recipient from a personal Gmail account can be silently filtered into spam even on a fully successful send. Confirmed in testing: sending to the account's own address worked immediately and visibly; sending to a different address returned success with no error, but the message landed in that recipient's spam folder. If deliverability to unfamiliar recipients matters, a transactional email API (Resend, SendGrid) gives an actual delivery status instead of "the SMTP handshake didn't error."
 
 ---
 
@@ -86,6 +98,7 @@ Chatbot/
 │       ├── search.py        # web_search        (read)
 │       ├── rag.py           # search_documents  (read)
 │       ├── notes.py         # save_note         (WRITE)
+│       ├── mailer.py        # send_email        (WRITE)
 │       └── mcp_bridge.py    # remote MCP tools, fail-closed classification
 ├── memory/
 │   ├── short_term.py        # SQLite messages + chats
@@ -114,6 +127,8 @@ pip install -r requirements.txt
 ```
 GROQ_API_KEY=your_key_here
 GROQ_MODEL=openai/gpt-oss-120b
+GMAIL_ADDRESS=your_address@gmail.com
+GMAIL_APP_PASSWORD=your_16_char_app_password
 ```
 
 Two terminals:
@@ -167,21 +182,23 @@ Routed workflow (`router.py`, deleted) replaced by a real tool-calling loop, the
 
 **A resumed node re-executes from its first line** — parsing is split out (`plan_calls`) so nothing before the gate has side effects.
 
-**`tools_used` counts executions, not tool messages** — a cancelled call still needs a reply message, so counting messages made cancellations look like they'd run.
-
 **Valid JSON isn't valid arguments** — `{}` passes the JSON check and dies inside the tool; required fields are now checked against the schema first.
 
 **Tool descriptions are load-bearing**, especially for write tools — a vague one means the model proposes unwanted actions and the gate becomes click-through.
 
-**MCP annotations can't be trusted, and often aren't even sent** — DeepWiki proved this: a genuinely read-only server, zero annotations. Fail closed on absence, not just on an explicit "unsafe" hint.
+**MCP annotations can't be trusted, and often aren't even sent** — fail closed on absence, not just on an explicit "unsafe" hint.
 
-**`asyncio.run()` fails inside an already-running event loop** — hit this at MCP registration time under `uvicorn --reload`. Fixed with a helper that checks for a running loop first and falls back to a separate thread if one exists.
+**`asyncio.run()` fails inside an already-running event loop** — hit at MCP registration time under `uvicorn --reload`; fixed with a helper that checks for a running loop first and falls back to a separate thread.
 
-**A closure built inside a `for` loop captures the loop variable, not its value** — caught before running: registering MCP tools in a loop needs each tool's name frozen via a real function argument, or every registered tool ends up calling whichever name was left over after the loop finished.
+**A closure built inside a `for` loop captures the loop variable, not its value** — MCP tool registration freezes each tool's name via a real function argument, not a loop-scoped one.
 
-**Long-term memory was duplicating and losing facts** — `collection.add()` with a random id per call meant every turn created a new entry instead of updating one; fixed with a fixed id per user and `upsert`. Separately, each extraction only saw the current turn, so an update about your job would silently erase your name — fixed by showing the model its own existing profile and asking it to preserve and extend it, not replace it.
+**Long-term memory was duplicating and losing facts** — fixed with a fixed id per user plus `upsert`, and by showing the model its own existing profile so it extends rather than replaces it. The "return NONE" check also needed `in`, not `==` — the model often wraps NONE in a full sentence.
 
-**The "return NONE" check needs `in`, not `==`** — the model often wraps NONE in a full sentence even when told to answer with just that word; checking for exact equality let garbage sentences through as if they were real facts.
+**Gmail app passwords require 2-Step Verification to be genuinely on**, and are unavailable outright on Google Workspace accounts with the setting disabled by an admin, or on accounts with Advanced Protection enabled — invisible from the app's side either way.
+
+**Not named `email.py`** — Python's own standard library has a built-in `email` module (used to build the message); naming the file the same thing would shadow it. Named `mailer.py` instead.
+
+**A successful SMTP send does not mean the message was delivered** — Gmail can accept a message and then silently filter it into the recipient's spam folder afterward, especially for a recipient the sending account has no prior history with. No exception is raised in this case; the tool correctly reports `"Email sent"` because, as far as SMTP is concerned, it was.
 
 **Chroma corrupts its HNSW index on delete-then-reingest in one process** — restart between the two.
 
@@ -193,11 +210,12 @@ Routed workflow (`router.py`, deleted) replaced by a real tool-calling loop, the
 - Switching chats in the sidebar orphans a parked approval in `checkpoints.db`.
 - Tool calls aren't persisted, so the `🔧` caption vanishes on chat reload.
 - One MCP server connected (DeepWiki); no allowlist yet, so even its harmless tools are gated by default.
+- `send_email` has no delivery confirmation beyond SMTP acceptance — a successful call can still land in spam, and personal Gmail is capped at 500 sends/day.
 - Single hardcoded `default_user`; one Chroma collection shared across all chats.
 
 ### Next
 
-An allowlist so verified-safe MCP tools can skip the gate on the developer's own decision, not the server's claim. Then Phase 4 (tool-selection, trajectory, and RAG evaluation) and LinkedIn as the second write tool.
+An allowlist so verified-safe MCP tools can skip the gate on the developer's own decision, not the server's claim. Then Phase 4 (tool-selection, trajectory, and RAG evaluation) and LinkedIn as another write tool.
 
 ---
 
